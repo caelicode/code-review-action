@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+    branches: ['**']
+    paths-ignore: ['**.md']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm clean-install
+
+      - name: Rebuild dist bundle
+        run: npm run build
+
+      - name: Verify dist is up to date
+        run: |
+          if [ -n "$(git diff --name-only dist/)" ]; then
+            echo "::error::dist/ is out of date. Run 'npm run build' and commit the result."
+            git diff --stat dist/
+            exit 1
+          fi
+          echo "dist/ is up to date."
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate action.yml
+        run: |
+          python3 -c "
+          import yaml, sys
+          with open('action.yml') as f:
+              data = yaml.safe_load(f)
+          required_fields = ['name', 'inputs', 'runs']
+          for field in required_fields:
+              assert field in data, f'Missing required field: {field}'
+          assert data['runs']['using'] == 'node20', 'Expected node20 runtime'
+          assert 'anthropic_api_key' in data['inputs'], 'Missing anthropic_api_key input'
+          print('action.yml is valid')
+          "

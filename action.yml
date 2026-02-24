@@ -1,0 +1,60 @@
+name: 'CaeliCode Code Review'
+description: 'AI-powered PR review using Claude — inline comments on bugs, security issues, and logic errors.'
+author: 'CaeliCode'
+
+branding:
+  icon: 'eye'
+  color: 'purple'
+
+inputs:
+  anthropic_api_key:
+    description: 'Anthropic API key for Claude'
+    required: true
+  model:
+    description: 'Claude model to use'
+    required: false
+    default: 'claude-sonnet-4-5-20250929'
+  max_tokens:
+    description: 'Maximum response tokens from Claude'
+    required: false
+    default: '4096'
+  review_scope:
+    description: 'Comma-separated focus areas: bugs, security, logic, performance, error-handling'
+    required: false
+    default: 'bugs,security,logic'
+  severity:
+    description: 'Minimum severity to comment on: low, medium, high'
+    required: false
+    default: 'medium'
+  include_paths:
+    description: 'Comma-separated glob patterns for files to review (default: all changed files)'
+    required: false
+    default: ''
+  exclude_paths:
+    description: 'Comma-separated glob patterns for files to skip'
+    required: false
+    default: '*.lock,*.min.js,*.min.css,dist/**,node_modules/**,package-lock.json,yarn.lock'
+  max_files:
+    description: 'Skip review if PR touches more than N files (0 = no limit)'
+    required: false
+    default: '20'
+  post_summary:
+    description: 'Post a summary comment on the PR'
+    required: false
+    default: 'true'
+  github_token:
+    description: 'GitHub token for posting review comments'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  comments_count:
+    description: 'Number of inline review comments posted'
+  summary:
+    description: 'The review summary text'
+  files_reviewed:
+    description: 'Number of files reviewed'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
