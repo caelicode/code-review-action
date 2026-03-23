@@ -36460,7 +36460,7 @@ const pop = (obj, key) => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //# sourceMappingURL=sleep.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/version.mjs
-const sdk_version_VERSION = '0.78.0'; // x-release-please-version
+const sdk_version_VERSION = '0.80.0'; // x-release-please-version
 //# sourceMappingURL=version.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/internal/detect-platform.mjs
 // File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
@@ -36717,6 +36717,27 @@ const FallbackEncoder = ({ headers, body }) => {
     };
 };
 //# sourceMappingURL=request-options.mjs.map
+;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/internal/utils/query.mjs
+// File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
+
+/**
+ * Basic re-implementation of `qs.stringify` for primitive types.
+ */
+function stringifyQuery(query) {
+    return Object.entries(query)
+        .filter(([_, value]) => typeof value !== 'undefined')
+        .map(([key, value]) => {
+        if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+            return `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+        }
+        if (value === null) {
+            return `${encodeURIComponent(key)}=`;
+        }
+        throw new error_AnthropicError(`Cannot stringify type ${typeof value}; Expected string, number, boolean, or null. If you need to pass nested query parameters, you can manually encode them, e.g. { query: { 'foo[key1]': value1, 'foo[key2]': value2 } }, and please open a GitHub issue requesting better support for your use case.`);
+    })
+        .join('&');
+}
+//# sourceMappingURL=query.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/internal/utils/bytes.mjs
 function concatBytes(buffers) {
     let length = 0;
@@ -41190,6 +41211,7 @@ var _BaseAnthropic_instances, _a, _BaseAnthropic_encoder, _BaseAnthropic_baseURL
 
 
 
+
 const HUMAN_PROMPT = '\\n\\nHuman:';
 const AI_PROMPT = '\\n\\nAssistant:';
 /**
@@ -41299,18 +41321,7 @@ class BaseAnthropic {
      * Basic re-implementation of `qs.stringify` for primitive types.
      */
     stringifyQuery(query) {
-        return Object.entries(query)
-            .filter(([_, value]) => typeof value !== 'undefined')
-            .map(([key, value]) => {
-            if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-                return `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
-            }
-            if (value === null) {
-                return `${encodeURIComponent(key)}=`;
-            }
-            throw new error_AnthropicError(`Cannot stringify type ${typeof value}; Expected string, number, boolean, or null. If you need to pass nested query parameters, you can manually encode them, e.g. { query: { 'foo[key1]': value1, 'foo[key2]': value2 } }, and please open a GitHub issue requesting better support for your use case.`);
-        })
-            .join('&');
+        return stringifyQuery(query);
     }
     getUserAgent() {
         return `${this.constructor.name}/JS ${sdk_version_VERSION}`;
@@ -41327,8 +41338,9 @@ class BaseAnthropic {
             new URL(path)
             : new URL(baseURL + (baseURL.endsWith('/') && path.startsWith('/') ? path.slice(1) : path));
         const defaultQuery = this.defaultQuery();
-        if (!isEmptyObj(defaultQuery)) {
-            query = { ...defaultQuery, ...query };
+        const pathQuery = Object.fromEntries(url.searchParams);
+        if (!isEmptyObj(defaultQuery) || !isEmptyObj(pathQuery)) {
+            query = { ...pathQuery, ...defaultQuery, ...query };
         }
         if (typeof query === 'object' && query && !Array.isArray(query)) {
             url.search = this.stringifyQuery(query);
@@ -41571,9 +41583,9 @@ class BaseAnthropic {
                 timeoutMillis = Date.parse(retryAfterHeader) - Date.now();
             }
         }
-        // If the API asks us to wait a certain amount of time (and it's a reasonable amount),
-        // just do what it says, but otherwise calculate a default
-        if (!(timeoutMillis && 0 <= timeoutMillis && timeoutMillis < 60 * 1000)) {
+        // If the API asks us to wait a certain amount of time, just do what it
+        // says, but otherwise calculate a default
+        if (timeoutMillis === undefined) {
             const maxRetries = options.maxRetries ?? this.maxRetries;
             timeoutMillis = this.calculateDefaultRetryTimeoutMillis(retriesRemaining, maxRetries);
         }
