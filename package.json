@@ -16,10 +16,10 @@
   "dependencies": {
     "@actions/core": "^3.0.1",
     "@actions/github": "^9.1.1",
-    "@anthropic-ai/sdk": "^0.102.0"
+    "@anthropic-ai/sdk": "^0.111.0"
   },
   "devDependencies": {
-    "@vercel/ncc": "^0.38.4"
+    "@vercel/ncc": "^0.44.0"
   },
   "release": {
     "branches": ["main"],
