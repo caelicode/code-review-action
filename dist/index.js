@@ -30050,7 +30050,7 @@ class InternalServerError extends APIError {
 
 /***/ }),
 
-/***/ 4055:
+/***/ 5176:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
 
 
@@ -30109,7 +30109,7 @@ const sleep = (ms, signal) => new Promise((resolve) => {
 // EXTERNAL MODULE: ./node_modules/@anthropic-ai/sdk/internal/errors.mjs
 var errors = __nccwpck_require__(2533);
 ;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/version.mjs
-const VERSION = '0.111.0'; // x-release-please-version
+const VERSION = '0.115.0'; // x-release-please-version
 //# sourceMappingURL=version.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/internal/detect-platform.mjs
 // File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
@@ -30269,6 +30269,52 @@ const getPlatformHeaders = () => {
     return (_platformHeaders ?? (_platformHeaders = getPlatformProperties()));
 };
 //# sourceMappingURL=detect-platform.mjs.map
+;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/internal/request-signal.mjs
+/**
+ * Tracks the removal of the per-request abort listener that
+ * `fetchWithTimeout` attaches to a caller-provided signal, so the listener's
+ * lifetime matches the request instead of the signal.
+ *
+ * Without removal, a long-lived signal (e.g. one AbortController reused for
+ * a whole session) accumulates one `{ once: true }` listener plus its bound
+ * AbortController per HTTP attempt until the signal fires or is collected,
+ * and Node warns at the 11th listener. The listener must survive until the
+ * response body is settled - removing it when fetch resolves (headers) would
+ * break aborting an in-flight body read - so the code that finishes the body
+ * (response parsing, stream teardown, retry/error handling) calls
+ * `releaseRequestSignal` with the request's controller.
+ */
+const cleanups = new WeakMap();
+const registry = typeof globalThis.FinalizationRegistry === 'function' ?
+    new globalThis.FinalizationRegistry((controller) => releaseRequestSignal(controller))
+    : null;
+// Module-scope factory so the cleanup closure captures exactly the signal and
+// the listener - built at the `fetchWithTimeout` call site it would share that
+// scope's context and retain the request body for as long as the cleanup is
+// held (same reason `_makeAbort` exists in client.ts).
+function makeCleanup(signal, listener) {
+    return () => signal.removeEventListener('abort', listener);
+}
+function registerRequestSignalCleanup(controller, signal, listener) {
+    cleanups.set(controller, makeCleanup(signal, listener));
+}
+// The registered target is the response BODY, not the Response: a caller can
+// keep a reader on the body and drop the Response wrapper (`.asResponse()`),
+// and the listener must survive for as long as anything can still read - the
+// body is what a live read keeps alive.
+function armAbandonmentBackstop(body, controller) {
+    if (cleanups.has(controller))
+        registry?.register(body, controller, controller);
+}
+function releaseRequestSignal(controller) {
+    const cleanup = cleanups.get(controller);
+    if (cleanup) {
+        cleanups.delete(controller);
+        registry?.unregister(controller);
+        cleanup();
+    }
+}
+//# sourceMappingURL=request-signal.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/internal/shims.mjs
 // File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
 function getDefaultFetch() {
@@ -31572,6 +31618,7 @@ var _Stream_client;
 
 
 
+
 class streaming_Stream {
     constructor(iterator, controller, client) {
         this.iterator = iterator;
@@ -31687,6 +31734,7 @@ class streaming_Stream {
                 // If the user `break`s, abort the ongoing request.
                 if (!done)
                     controller.abort();
+                releaseRequestSignal(controller);
             }
         }
         return new streaming_Stream(iterator, controller, client);
@@ -31734,6 +31782,7 @@ class streaming_Stream {
                 // If the user `break`s, abort the ongoing request.
                 if (!done)
                     controller.abort();
+                releaseRequestSignal(controller);
             }
         }
         return new streaming_Stream(iterator, controller, client);
@@ -31901,6 +31950,7 @@ function partition(str, delimiter) {
 // File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
 
 
+
 async function defaultParseResponse(client, props) {
     const { response, requestLogID, retryOfRequestLogID, startTime } = props;
     const body = await (async () => {
@@ -31931,7 +31981,15 @@ async function defaultParseResponse(client, props) {
         }
         const text = await response.text();
         return text;
-    })();
+    })().finally(() => {
+        // The body is settled (or parsing threw), so the caller-signal abort
+        // listener has nothing left to cancel. Streams release in their own
+        // teardown; a raw Response (`__binaryResponse`) keeps the listener so
+        // aborting an in-flight download still works.
+        if (!props.options.stream && !props.options.__binaryResponse) {
+            releaseRequestSignal(props.controller);
+        }
+    });
     (0,utils_log/* loggerFor */.WG)(client).debug(`[${requestLogID}] response parsed`, (0,utils_log/* formatRequestDetails */.xL)({
         retryOfRequestLogID,
         url: response.url,
@@ -33672,7 +33730,7 @@ class Agents extends APIResource {
      * const betaManagedAgentsAgent =
      *   await client.beta.agents.update(
      *     'agent_011CZkYpogX7uDKUyvBTophP',
-     *     { version: 1 },
+     *     { description: 'updated' },
      *   );
      * ```
      */
@@ -36944,6 +37002,9 @@ class BetaMessageStream {
                 if (event.usage.iterations != null) {
                     snapshot.usage.iterations = event.usage.iterations;
                 }
+                if (event.usage.fallback_credit != null) {
+                    snapshot.usage.fallback_credit = event.usage.fallback_credit;
+                }
                 return snapshot;
             case 'content_block_start':
                 snapshot.content.push(event.content_block);
@@ -37479,15 +37540,13 @@ async function generateToolResponse(params, lastMessage = params.messages.at(-1)
     if (toolUseBlocks.length === 0) {
         return null;
     }
+    const available = availableToolNames(params);
     const toolResults = await Promise.all(toolUseBlocks.map(async (toolUse) => {
         const tool = params.tools.find((t) => ('name' in t ? t.name : t.mcp_server_name) === toolUse.name);
-        if (!tool || !('run' in tool)) {
-            return {
-                type: 'tool_result',
-                tool_use_id: toolUse.id,
-                content: `Error: Tool '${toolUse.name}' not found`,
-                is_error: true,
-            };
+        // A `tool_removal` is only a hint to the model, which may still emit a tool_use for a
+        // withdrawn tool — treat those exactly like a tool that was never defined.
+        if (!tool || !('run' in tool) || !available.has(toolUse.name)) {
+            return toolNotFoundResult(toolUse);
         }
         try {
             let input = toolUse.input;
@@ -37520,6 +37579,81 @@ async function generateToolResponse(params, lastMessage = params.messages.at(-1)
         role: 'user',
         content: toolResults,
     };
+}
+function toolNotFoundResult(toolUse) {
+    return {
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: `Error: Tool '${toolUse.name}' not found`,
+        is_error: true,
+    };
+}
+/**
+ * Computes the names of locally runnable tools that are still available for the assistant
+ * turn being answered, by folding `tool_removal` / `tool_addition` blocks from the
+ * `role: "system"` messages over the runnable tools. The assistant turn being answered is
+ * terminal-or-absent and only `system` messages are inspected, so folding the whole current
+ * history is exactly folding the messages preceding that turn — call this before appending
+ * anything after it. MCP references are ignored — those tools are executed server-side and
+ * never dispatched by this runner.
+ */
+function availableToolNames(params) {
+    const available = new Set();
+    for (const tool of params.tools) {
+        if ('run' in tool) {
+            available.add(tool.name);
+        }
+    }
+    for (const message of params.messages) {
+        if (message.role !== 'system' || typeof message.content === 'string') {
+            continue;
+        }
+        for (const block of message.content) {
+            applyToolChange(block, available);
+        }
+    }
+    return available;
+}
+function applyToolChange(block, available) {
+    switch (block.type) {
+        case 'tool_removal':
+        case 'tool_addition':
+            applyToolReference(block, available);
+            break;
+        case 'mid_conv_system':
+            // A `mid_conv_system` block's content is limited by the API schema to
+            // text / tool_addition / tool_removal, so we walk exactly one level — no recursion.
+            for (const inner of block.content) {
+                if (inner.type === 'tool_removal' || inner.type === 'tool_addition') {
+                    applyToolReference(inner, available);
+                }
+            }
+            break;
+        default:
+            // Other and unknown/newer block types leave the set untouched (forward compatibility).
+            break;
+    }
+}
+function applyToolReference(block, available) {
+    const name = referencedToolName(block.tool);
+    if (name === undefined)
+        return;
+    if (block.type === 'tool_removal') {
+        available.delete(name);
+    }
+    else {
+        available.add(name);
+    }
+}
+function referencedToolName(ref) {
+    switch (ref.type) {
+        case 'tool_reference':
+            return ref.name;
+        default:
+            // mcp_tool_reference / mcp_toolset_reference run server-side; unknown reference
+            // types are ignored rather than rejected.
+            return undefined;
+    }
 }
 //# sourceMappingURL=BetaToolRunner.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/resources/beta/messages/messages.mjs
@@ -37984,8 +38118,9 @@ class events_Events extends APIResource {
      * ```
      */
     stream(threadID, params, options) {
-        const { session_id, betas } = params;
+        const { session_id, betas, ...query } = params;
         return this._client.get(path `/v1/sessions/${session_id}/threads/${threadID}/stream?beta=true`, {
+            query,
             ...options,
             headers: buildHeaders([
                 { 'anthropic-beta': [...(betas ?? []), 'managed-agents-2026-04-01'].toString() },
@@ -38456,6 +38591,309 @@ class Skills extends APIResource {
 }
 Skills.Versions = versions_Versions;
 //# sourceMappingURL=skills.mjs.map
+;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/resources/beta/tunnels/certificates.mjs
+// File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
+
+
+
+
+class Certificates extends APIResource {
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Registers a public CA certificate on a tunnel. Anthropic verifies the gateway's
+     * server certificate against this CA when it terminates the inner TLS session. A
+     * tunnel holds at most two non-archived certificates.
+     *
+     * @example
+     * ```ts
+     * const betaTunnelCertificate =
+     *   await client.beta.tunnels.certificates.create(
+     *     'tunnel_id',
+     *     { ca_certificate_pem: 'ca_certificate_pem' },
+     *   );
+     * ```
+     */
+    create(tunnelID, params, options) {
+        const { betas, ...body } = params;
+        return this._client.post(path `/v1/tunnels/${tunnelID}/certificates?beta=true`, {
+            body,
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Fetches a tunnel certificate by ID.
+     *
+     * @example
+     * ```ts
+     * const betaTunnelCertificate =
+     *   await client.beta.tunnels.certificates.retrieve(
+     *     'certificate_id',
+     *     { tunnel_id: 'tunnel_id' },
+     *   );
+     * ```
+     */
+    retrieve(certificateID, params, options) {
+        const { tunnel_id, betas } = params;
+        return this._client.get(path `/v1/tunnels/${tunnel_id}/certificates/${certificateID}?beta=true`, {
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Lists the certificates registered on a tunnel. Archived certificates are
+     * excluded unless include_archived is set.
+     *
+     * @example
+     * ```ts
+     * // Automatically fetches more pages as needed.
+     * for await (const betaTunnelCertificate of client.beta.tunnels.certificates.list(
+     *   'tunnel_id',
+     * )) {
+     *   // ...
+     * }
+     * ```
+     */
+    list(tunnelID, params = {}, options) {
+        const { betas, ...query } = params ?? {};
+        return this._client.getAPIList(path `/v1/tunnels/${tunnelID}/certificates?beta=true`, (PageCursor), {
+            query,
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Archives a tunnel certificate, removing it from the set Anthropic trusts for the
+     * tunnel. The certificate record is retained. Archiving the last non-archived
+     * certificate is permitted; the tunnel rejects MCP traffic until a new certificate
+     * is added.
+     *
+     * @example
+     * ```ts
+     * const betaTunnelCertificate =
+     *   await client.beta.tunnels.certificates.archive(
+     *     'certificate_id',
+     *     { tunnel_id: 'tunnel_id' },
+     *   );
+     * ```
+     */
+    archive(certificateID, params, options) {
+        const { tunnel_id, betas } = params;
+        return this._client.post(path `/v1/tunnels/${tunnel_id}/certificates/${certificateID}/archive?beta=true`, {
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+}
+//# sourceMappingURL=certificates.mjs.map
+;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/resources/beta/tunnels/tunnels.mjs
+// File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
+
+
+
+
+
+
+class Tunnels extends APIResource {
+    constructor() {
+        super(...arguments);
+        this.certificates = new Certificates(this._client);
+    }
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Creates a tunnel. Creation allocates a fresh hostname and provisions the tunnel;
+     * it is not idempotent. The new tunnel rejects MCP traffic until at least one CA
+     * certificate is added.
+     *
+     * @example
+     * ```ts
+     * const betaTunnel = await client.beta.tunnels.create();
+     * ```
+     */
+    create(params, options) {
+        const { betas, ...body } = params;
+        return this._client.post('/v1/tunnels?beta=true', {
+            body,
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Fetches a tunnel by ID.
+     *
+     * @example
+     * ```ts
+     * const betaTunnel = await client.beta.tunnels.retrieve(
+     *   'tunnel_id',
+     * );
+     * ```
+     */
+    retrieve(tunnelID, params = {}, options) {
+        const { betas } = params ?? {};
+        return this._client.get(path `/v1/tunnels/${tunnelID}?beta=true`, {
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Lists tunnels. Results are ordered by creation time, newest first; archived
+     * tunnels are excluded unless include_archived is set.
+     *
+     * @example
+     * ```ts
+     * // Automatically fetches more pages as needed.
+     * for await (const betaTunnel of client.beta.tunnels.list()) {
+     *   // ...
+     * }
+     * ```
+     */
+    list(params = {}, options) {
+        const { betas, ...query } = params ?? {};
+        return this._client.getAPIList('/v1/tunnels?beta=true', (PageCursor), {
+            query,
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Archives a tunnel. Archival is irreversible: every non-archived certificate on
+     * the tunnel is archived in the same operation, the hostname is retired and never
+     * re-allocated, and the tunnel token is invalidated. Retrying against an
+     * already-archived tunnel returns the existing record unchanged.
+     *
+     * @example
+     * ```ts
+     * const betaTunnel = await client.beta.tunnels.archive(
+     *   'tunnel_id',
+     * );
+     * ```
+     */
+    archive(tunnelID, params = {}, options) {
+        const { betas } = params ?? {};
+        return this._client.post(path `/v1/tunnels/${tunnelID}/archive?beta=true`, {
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Reveals a tunnel's connector token. The value is fetched live on each call;
+     * Anthropic does not store it. Repeated calls return the same value until the
+     * token is rotated. Exposed as POST so the token does not appear in intermediary
+     * access logs.
+     *
+     * @example
+     * ```ts
+     * const betaTunnelToken =
+     *   await client.beta.tunnels.revealToken('tunnel_id');
+     * ```
+     */
+    revealToken(tunnelID, params = {}, options) {
+        const { betas } = params ?? {};
+        return this._client.post(path `/v1/tunnels/${tunnelID}/reveal_token?beta=true`, {
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+    /**
+     * The Tunnels API is in research preview. It requires the
+     * `anthropic-beta: mcp-tunnels-2026-06-22` header and may change without a
+     * deprecation period. It supersedes the Admin API endpoints at
+     * `/v1/organizations/tunnels`, which remain available during a migration window.
+     *
+     * Rotates a tunnel's connector token. Rotation invalidates the current token for
+     * new connections and returns a fresh value; established connections are not
+     * severed. A connector restarted after rotation must use the new value.
+     *
+     * @example
+     * ```ts
+     * const betaTunnelToken =
+     *   await client.beta.tunnels.rotateToken('tunnel_id');
+     * ```
+     */
+    rotateToken(tunnelID, params, options) {
+        const { betas, ...body } = params;
+        return this._client.post(path `/v1/tunnels/${tunnelID}/rotate_token?beta=true`, {
+            body,
+            ...options,
+            headers: buildHeaders([
+                { 'anthropic-beta': [...(betas ?? []), 'mcp-tunnels-2026-06-22'].toString() },
+                options?.headers,
+            ]),
+        });
+    }
+}
+Tunnels.Certificates = Certificates;
+//# sourceMappingURL=tunnels.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/resources/beta/vaults/credentials.mjs
 // File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
 
@@ -38806,6 +39244,8 @@ Vaults.Credentials = Credentials;
 
 
 
+
+
 class Beta extends APIResource {
     constructor() {
         super(...arguments);
@@ -38823,6 +39263,7 @@ class Beta extends APIResource {
         this.webhooks = new Webhooks(this._client);
         this.userProfiles = new UserProfiles(this._client);
         this.dreams = new Dreams(this._client);
+        this.tunnels = new Tunnels(this._client);
     }
 }
 Beta.Models = Models;
@@ -38839,6 +39280,7 @@ Beta.Skills = Skills;
 Beta.Webhooks = Webhooks;
 Beta.UserProfiles = UserProfiles;
 Beta.Dreams = Dreams;
+Beta.Tunnels = Tunnels;
 //# sourceMappingURL=beta.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/@anthropic-ai/sdk/resources/completions.mjs
 // File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
@@ -39898,6 +40340,7 @@ var _BaseAnthropic_instances, _a, _BaseAnthropic_encoder, _BaseAnthropic_baseURL
 
 
 
+
 const HUMAN_PROMPT = '\\n\\nHuman:';
 const AI_PROMPT = '\\n\\nAssistant:';
 /**
@@ -40025,7 +40468,7 @@ class BaseAnthropic {
                 else if (options.profile != null) {
                     this._authState.resolution = this._resolveDefaultCredentials(options.profile);
                 }
-                else {
+                else if (this._shouldResolveDefaultCredentials()) {
                     // No explicit auth provided — lazily resolve from the credential
                     // chain on first request. Errors are captured into _auth.error and
                     // surfaced on first use rather than as an unhandled rejection.
@@ -40033,6 +40476,16 @@ class BaseAnthropic {
                 }
             }
         }
+    }
+    /**
+     * Whether to lazily resolve auth from the default credential chain when no
+     * explicit auth is configured. Called once from the constructor, so
+     * overrides must not depend on subclass instance state. Subclasses that
+     * bring their own auth scheme return false so unrelated local credentials
+     * are never resolved or allowed to supply a base URL.
+     */
+    _shouldResolveDefaultCredentials() {
+        return true;
     }
     /**
      * Stores a profile/config-supplied base URL on the shared auth state and, if
@@ -40375,6 +40828,7 @@ class BaseAnthropic {
         }).catch(errors/* castToError */.r);
         const headersTime = Date.now();
         if (response instanceof globalThis.Error) {
+            releaseRequestSignal(controller);
             const retryMessage = `retrying, ${retriesRemaining} attempts remaining`;
             if (options.signal?.aborted) {
                 throw new core_error/* APIUserAbortError */.cH();
@@ -40439,6 +40893,7 @@ class BaseAnthropic {
                 const retryMessage = `retrying, ${retriesRemaining} attempts remaining`;
                 // We don't need the body of this response.
                 await CancelReadableStream(response.body);
+                releaseRequestSignal(controller);
                 (0,utils_log/* loggerFor */.WG)(this).info(`${responseInfo} - ${retryMessage}`);
                 (0,utils_log/* loggerFor */.WG)(this).debug(`[${requestLogID}] response error (${retryMessage})`, (0,utils_log/* formatRequestDetails */.xL)({
                     retryOfRequestLogID,
@@ -40462,6 +40917,7 @@ class BaseAnthropic {
                 message: errMessage,
                 durationMs: Date.now() - startTime,
             }));
+            releaseRequestSignal(controller);
             const err = this.makeStatusError(response.status, errJSON, errMessage, response.headers);
             throw err;
         }
@@ -40473,6 +40929,7 @@ class BaseAnthropic {
             headers: response.headers,
             durationMs: headersTime - startTime,
         }));
+        armAbandonmentBackstop(response.body ?? response, controller);
         return { response, options, controller, requestLogID, retryOfRequestLogID, startTime };
     }
     getAPIList(path, Page, opts) {
@@ -40493,8 +40950,10 @@ class BaseAnthropic {
         // the lifetime of the signal. Using `.bind()` only retains a reference to the
         // controller itself.
         const abort = this._makeAbort(controller);
-        if (signal)
+        if (signal) {
             signal.addEventListener('abort', abort, { once: true });
+            registerRequestSignalCleanup(controller, signal, abort);
+        }
         const isReadableBody = (globalThis.ReadableStream && options.body instanceof globalThis.ReadableStream) ||
             (typeof options.body === 'object' && options.body !== null && Symbol.asyncIterator in options.body);
         const fetchOptions = {
@@ -40789,7 +41248,7 @@ Anthropic.Beta = Beta;
 
 const encoder = new TextEncoder();
 /** Betas sent by default; override with {@link BetaRefusalFallbackOptions.betas}. */
-const DEFAULT_BETAS = (/* unused pure expression or super */ null && (['fallback-credit-2026-06-01']));
+const DEFAULT_BETAS = (/* unused pure expression or super */ null && (['fallback-credit-2026-07-01']));
 /**
  * Remove `fallback` blocks replayed in history. They only parse under the
  * server-side fallback beta, which belongs to the caller-owned server-side
@@ -40805,11 +41264,50 @@ function stripFallbackBlocks(body) {
     return { ...body, messages };
 }
 /**
+ * Apply one chain entry to the original request params as a patch: a field
+ * set to a value overrides the original, a field explicitly `null` removes
+ * the field from the retried request, and an absent (or `undefined`) field
+ * keeps the original value. `output_config` patches one level deep — its
+ * subfields follow the same set/`null`/absent rules against the original
+ * `output_config` (created if the entry sets any subfield). Every hop patches
+ * the original params — never a previous hop's patched body — and `body` is
+ * never mutated.
+ */
+function applyFallbackPatch(body, entry) {
+    const patched = { ...body };
+    for (const [key, value] of Object.entries(entry)) {
+        if (key === 'output_config' && value != null) {
+            const merged = { ...(patched[key] ?? {}) };
+            for (const [subKey, subValue] of Object.entries(value)) {
+                patchField(merged, subKey, subValue);
+            }
+            patchField(patched, key, Object.keys(merged).length ? merged : null);
+        }
+        else {
+            patchField(patched, key, value);
+        }
+    }
+    return patched;
+}
+/** Set/`null`-unset/absent-keep one field on `target` (mutated). */
+function patchField(target, key, value) {
+    if (value === undefined)
+        return;
+    if (value === null) {
+        delete target[key];
+    }
+    else {
+        target[key] = value;
+    }
+}
+/**
  * Middleware that retries refused `/v1/messages` requests down a fallback chain.
  *
  * Non-streaming: when a response comes back with `stop_reason: 'refusal'`, the
- * request is retried with each entry of `fallbacks` merged over the original
- * params — passing along the refusal's `fallback_credit_token` — until a model
+ * request is retried with each entry of `fallbacks` applied as a patch to the
+ * original params (a set field overrides, an explicit `null` unsets, an absent
+ * field keeps the original value; entries never patch each other's requests)
+ * — passing along the refusal's `fallback_credit_token` — until a model
  * accepts or the chain is exhausted. A message served by a fallback carries a
  * `fallback` content block prepended at each model boundary — the same seam
  * block shape the server-side `fallbacks` param places in `content`, though
@@ -40871,7 +41369,7 @@ function betaRefusalFallbackMiddleware(fallbacks, options = {}) {
         }
         if (ctx.options.body.fallbacks != null) {
             throw new AnthropicError('Sending the `fallbacks:` request param is not supported when using the `betaRefusalFallbackMiddleware`. ' +
-                'You should either remove the middleware and send `fallbacks:` with the `server-side-fallback-2026-06-01` beta header to let the API handle refusal fallbacks, ' +
+                'You should either remove the middleware and send `fallbacks:` with the `server-side-fallback-2026-07-01` beta header to let the API handle refusal fallbacks, ' +
                 "or omit the `fallbacks:` param if you'd like `betaRefusalFallbackMiddleware` to handle fallbacks on the client side.");
         }
         const onError = options.onError ??
@@ -40896,14 +41394,10 @@ function betaRefusalFallbackMiddleware(fallbacks, options = {}) {
                 ctx.logger.warn('anthropic-sdk: betaRefusalFallbackMiddleware fell back without a `fallbackState` request option; follow-up requests will retry models that already refused. Pass a shared `{ fallbackState: new BetaFallbackState() }` to pin them to the accepted model.');
             }
         };
+        const initialBody = startIndex === -1 ? body : applyFallbackPatch(body, fallbacks[startIndex]);
         // a non-string body can't be respliced or redeemed against — leave the
         // request untouched (the streaming path stands down on it below too)
-        const initialRequest = typeof request.body !== 'string' ?
-            request
-            : {
-                ...request,
-                body: JSON.stringify(startIndex === -1 ? body : { ...body, ...fallbacks[startIndex] }),
-            };
+        const initialRequest = typeof request.body !== 'string' ? request : { ...request, body: JSON.stringify(initialBody) };
         const response = await next(initialRequest);
         if (!response.ok) {
             return response;
@@ -40932,7 +41426,7 @@ function betaRefusalFallbackMiddleware(fallbacks, options = {}) {
         let res = response;
         // The model the current hop was requested as — the caller's spelling, not
         // the server's `message.model` echo; the seam block's `from` carries it.
-        let requestedModel = (startIndex === -1 ? body : { ...body, ...fallbacks[startIndex] }).model;
+        let requestedModel = initialBody.model;
         const fallbackBlocks = [];
         while (index < fallbacks.length - 1) {
             const message = await ctx.parse(res);
@@ -40957,10 +41451,9 @@ function betaRefusalFallbackMiddleware(fallbacks, options = {}) {
             res = await next({
                 ...request,
                 body: JSON.stringify({
-                    ...body,
-                    ...entry,
+                    ...applyFallbackPatch(body, entry),
                     ...(message.stop_details?.fallback_credit_token ?
-                        { fallback_credit_token: message.stop_details.fallback_credit_token }
+                        { fallback_credit_token: creditTokenParam(message.stop_details.fallback_credit_token) }
                         : undefined),
                 }),
             });
@@ -41348,11 +41841,20 @@ class BlockTracker {
     }
 }
 // --- fallback request construction (appended-assistant continuation) -------
+/**
+ * Object form of the redeemed credit token. `best_effort` keeps the retry
+ * served if the token layer rejects it — the retry then proceeds at normal
+ * price and the outcome lands on `usage.fallback_credit` — where the
+ * bare-string (`strict`) form would 400 the whole request.
+ */
+function creditTokenParam(token) {
+    return { token, mode: 'best_effort' };
+}
 function buildFallbackRequest(orig, { model, creditToken, continuation, }) {
     // the caller guarantees a JSON string body (checked before stream A is read)
     const body = JSON.parse(orig.body);
     body.model = model;
-    body.fallback_credit_token = creditToken;
+    body.fallback_credit_token = creditTokenParam(creditToken);
     // Append the continuation (decided by the chain loop) as a trailing
     // assistant turn; everything else must stay identical to the refused
     // request. When the refusal granted no prefill claim, omit the turn
@@ -50042,8 +50544,8 @@ function formatDiffForPrompt(files) {
   return parts.join('\n');
 }
 
-// EXTERNAL MODULE: ./node_modules/@anthropic-ai/sdk/index.mjs + 81 modules
-var sdk = __nccwpck_require__(4055);
+// EXTERNAL MODULE: ./node_modules/@anthropic-ai/sdk/index.mjs + 84 modules
+var sdk = __nccwpck_require__(5176);
 ;// CONCATENATED MODULE: ./src/review.js
 
 
